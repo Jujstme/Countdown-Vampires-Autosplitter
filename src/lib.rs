@@ -288,11 +288,18 @@ struct Watchers {
 
 struct Offsets {
     gamecode_ntsc: u32,
-    hp: u32,
-    igt: u32,
-    map_id: u32,
-    item_1: u32,
-    ending: u32,
+    
+    hp_ntsc_u: u32,
+    igt_ntsc_u: u32,
+    map_id_ntsc_u: u32,
+    item_1_ntsc_u: u32,
+    ending_ntsc_u: u32,
+
+    hp_ntsc_j: u32,
+    igt_ntsc_j: u32,
+    map_id_ntsc_j: u32,
+    item_1_ntsc_j: u32,
+    ending_ntsc_j: u32,
 }
 
 // Offsets of data, relative to the beginning of the games VRAM
@@ -300,11 +307,18 @@ impl Offsets {
     fn new() -> Self {
         Self {
             gamecode_ntsc: 0x93DC,
-            hp: 0xB3F2E,
-            igt: 0xB3EFC,
-            map_id: 0xB3EF2,
-            item_1: 0xB3F42,
-            ending: 0xB3F28,
+
+            hp_ntsc_u: 0xB3F2E,
+            igt_ntsc_u: 0xB3EFC,
+            map_id_ntsc_u: 0xB3EF2,
+            item_1_ntsc_u: 0xB3F42,
+            ending_ntsc_u: 0xB3F28,
+
+            hp_ntsc_j: 0xB2F86,
+            igt_ntsc_j: 0xB2F54,
+            map_id_ntsc_j: 0xB2F4A,
+            item_1_ntsc_j: 0xB2FA6,
+            ending_ntsc_j: 0xB2F8C,
         }
     }
 }
@@ -316,22 +330,41 @@ fn update_loop(game: &Emulator, offsets: &Offsets, watchers: &mut Watchers) {
     {
         b"SLUS_008.98" | b"SLUS_011.99" => {
             // The gamecodes provided above ensure you are running the correct game
-            watchers.hp.update(game.read::<u16>(offsets.hp).ok());
+            watchers.hp.update(game.read::<u16>(offsets.hp_ntsc_u).ok());
             watchers.igt.update_infallible(frame_count::<30>(
-                game.read::<u32>(offsets.igt).unwrap_or_default() as _,
+                game.read::<u32>(offsets.igt_ntsc_u).unwrap_or_default() as _,
             ));
             watchers
                 .map_id
-                .update(game.read::<u16>(offsets.map_id).ok());
+                .update(game.read::<u16>(offsets.map_id_ntsc_u).ok());
             watchers.inventory.update_infallible(
-                game.read::<[[u16; 3]; 12]>(offsets.item_1)
+                game.read::<[[u16; 3]; 12]>(offsets.item_1_ntsc_u)
                     .unwrap_or_default()
                     .map(|[item, _, _]| item),
             );
             watchers
                 .ending
-                .update(game.read::<u16>(offsets.ending).ok());
+                .update(game.read::<u16>(offsets.ending_ntsc_u).ok());
         }
+
+        b"SLPS_025.04" | b"SLPS_025.05" => {
+            watchers.hp.update(game.read::<u16>(offsets.hp_ntsc_j).ok());
+            watchers.igt.update_infallible(frame_count::<30>(
+                game.read::<u32>(offsets.igt_ntsc_j).unwrap_or_default() as _,
+            ));
+            watchers
+            .map_id
+            .update(game.read::<u16>(offsets.map_id_ntsc_j).ok());
+            watchers.inventory.update_infallible(
+            game.read::<[[u16; 3]; 12]>(offsets.item_1_ntsc_j)
+                .unwrap_or_default()
+                .map(|[item, _, _]| item),
+        );
+            watchers
+            .ending
+            .update(game.read::<u16>(offsets.ending_ntsc_j).ok());
+        }
+        
         _ => {
             // If the emulator is loading the wrong game, the watchers will update to their default state
             watchers.hp.update_infallible(u16::default());
