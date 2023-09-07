@@ -1,0 +1,412 @@
+#![no_std]
+// #![feature(type_alias_impl_trait, const_async_blocks)]
+#![warn(
+    clippy::complexity,
+    clippy::correctness,
+    clippy::perf,
+    clippy::style,
+    clippy::undocumented_unsafe_blocks,
+    rust_2018_idioms
+)]
+
+use asr::{
+    emulator::ps1::{self, Emulator},
+    future::{next_tick, retry},
+    time::Duration,
+    timer::{self, TimerState},
+    watcher::Watcher, time_util::frame_count,
+};
+
+asr::panic_handler!();
+asr::async_main!(stable);
+
+async fn main() {
+    let settings = Settings::register();
+
+    loop {
+        // Hook to the target process
+        let mut emulator = retry(|| ps1::Emulator::attach()).await;
+        let mut watchers = Watchers::default();
+        let offsets = Offsets::new();
+
+        loop {
+            if !emulator.is_open() {
+                break;
+            }
+
+            if emulator.update() {
+                // Splitting logic. Adapted from OG LiveSplit:
+                // Order of execution
+                // 1. update() will always be run first. There are no conditions on the execution of this action.
+                // 2. If the timer is currently either running or paused, then the isLoading, gameTime, and reset actions will be run.
+                // 3. If reset does not return true, then the split action will be run.
+                // 4. If the timer is currently not running (and not paused), then the start action will be run.
+                update_loop(&emulator, &offsets, &mut watchers);
+
+                let timer_state = timer::state();
+                if timer_state == TimerState::Running || timer_state == TimerState::Paused {
+                    if let Some(is_loading) = is_loading(&watchers, &settings) {
+                        if is_loading {
+                            timer::pause_game_time()
+                        } else {
+                            timer::resume_game_time()
+                        }
+                    }
+
+                    if let Some(game_time) = game_time(&watchers, &settings) {
+                        timer::set_game_time(game_time)
+                    }
+
+                    if reset(&watchers, &settings) {
+                        timer::reset()
+                    } else if split(&watchers, &settings) {
+                        timer::split()
+                    }
+                }
+
+                if timer::state() == TimerState::NotRunning && start(&watchers, &settings) {
+                    timer::start();
+                    timer::pause_game_time();
+
+                    if let Some(is_loading) = is_loading(&watchers, &settings) {
+                        if is_loading {
+                            timer::pause_game_time()
+                        } else {
+                            timer::resume_game_time()
+                        }
+                    }
+                }
+            }
+            next_tick().await;
+        }
+    }
+}
+
+#[derive(asr::user_settings::Settings)]
+struct Settings {
+    #[default = false]
+    /// ---------- Start Conditions Below ----------
+    condit: bool,
+
+    #[default = true]
+    /// START --> Enable auto start
+    start: bool,
+
+    #[default = false]
+    /// ---------- Door Splits Below ----------
+    doors: bool,
+
+    #[default = false]
+    /// Door splits - Will split on every room
+    door_split: bool,
+
+    #[default = false]
+    /// ---------- Item Splits Below ----------
+    items: bool,
+
+    #[default = false]
+    /// Keno Ticket
+    keno: bool,
+
+    #[default = false]
+    /// VIP Suzie Card
+    susie: bool,
+
+    #[default = false]
+    /// VIP Nancy Card
+    nancy: bool,
+
+    #[default = false]
+    /// VIP Cheryl Card
+    cheryl: bool,
+
+    #[default = false]
+    /// Show Stage Key
+    stagekey: bool,
+
+    #[default = false]
+    /// VIP Leagan Card
+    leagan: bool,
+
+    #[default = false]
+    /// Attraction Key
+    attract: bool,
+
+    #[default = false]
+    /// Museum Key
+    museum: bool,
+
+    #[default = false]
+    /// Desert Moon Control Room Key
+    moon: bool,
+
+    #[default = false]
+    /// Key to "Evil House"
+    evil: bool,
+
+    #[default = false]
+    /// The Spear Key
+    spear: bool,
+
+    #[default = false]
+    /// Card Disk C
+    cardc: bool,
+
+    #[default = false]
+    /// Card Disk D
+    cardd: bool,
+
+    #[default = false]
+    /// VIP Sydney Card
+    sydney: bool,
+
+    #[default = false]
+    /// No.9 Playing Card
+    card9: bool,
+
+    #[default = false]
+    /// Blue Clock Hand
+    bluehand: bool,
+
+    #[default = false]
+    /// Red Clock Hand
+    redhand: bool,
+
+    #[default = false]
+    /// Panel No.1
+    panel1: bool,
+
+    #[default = false]
+    /// Event Room Key
+    event: bool,
+
+    #[default = false]
+    /// Panel No.2
+    panel2: bool,
+
+    #[default = false]
+    /// Panel No.4
+    panel4: bool,
+
+    #[default = false]
+    /// Panel No.6
+    panel6: bool,
+
+    #[default = false]
+    /// Y-Shaped Panel Key
+    ykey: bool,
+
+    #[default = false]
+    /// Key to Passageway D-4
+    d4: bool,
+
+    #[default = false]
+    /// Key to Shipping Area Parking Lot
+    lot: bool,
+
+    #[default = false]
+    /// Key to Campground Vehicle
+    camp: bool,
+
+    #[default = false]
+    /// Key to Small Storage Room
+    small: bool,
+
+    #[default = false]
+    /// Forklift Key
+    fork: bool,
+
+    #[default = false]
+    /// Log House Key
+    log: bool,
+
+    #[default = false]
+    /// Key to the "Guesthouse"
+    guest: bool,
+
+    #[default = false]
+    /// Shower Room Key
+    shower: bool,
+
+    #[default = false]
+    /// Key to Chainsaw Shelf
+    shelf: bool,
+
+    #[default = false]
+    /// Bourbon
+    bourbon: bool,
+
+    #[default = false]
+    /// Marlintown Gate Key
+    marlin: bool,
+
+    #[default = false]
+    /// Chainsaw
+    chain: bool,
+
+    #[default = false]
+    /// Observation Room Key
+    observ: bool,
+
+    #[default = false]
+    /// Sterilization Passageway Key
+   sterile: bool,
+
+   #[default = false]
+    /// M82A1
+   m8: bool,
+
+   #[default = false]
+    /// Code - SIN Key
+    sin: bool,
+
+    #[default = false]
+    /// Fuse
+    fuse: bool,
+
+    #[default = false]
+    /// ---------- End Split Below ----------
+    ending: bool,
+
+    #[default = false]
+    /// Splits on either Good End or Bad End
+    end: bool,
+
+}
+
+// Defines the watcher type of 
+#[derive(Default)]
+struct Watchers {
+    hp: Watcher<u16>,
+    igt: Watcher<u32>,
+    map_id: Watcher<u16>,
+    inventory: Watcher<[u16; 12]>,
+    ending: Watcher<u16>,
+}
+
+struct Offsets {
+    gamecode_ntsc: u32,
+    hp: u32,
+    igt: u32,
+    map_id: u32,
+    item_1: u32,
+    ending: u32,
+}
+
+// Offsets of data, relative to the beginning of the games VRAM
+impl Offsets {
+    fn new() -> Self {
+        Self {
+            gamecode_ntsc: 0x93DC,
+            hp: 0xB3F2E,
+            igt: 0xB3EFC,
+            map_id: 0xB3EF2,
+            item_1: 0xB3F42,
+            ending: 0xB3F28,
+        }
+    }
+}
+
+fn update_loop(game: &Emulator, offsets: &Offsets, watchers: &mut Watchers) {
+    let Ok(disc_gamecode) = game.read::<[u8; 11]>(offsets.gamecode_ntsc) else {
+        // Do stuff to reset your watchers
+        return;
+    };
+
+    match &disc_gamecode {
+        // Checks the ID of your disk, ensuring that the data here will only work with these specific ID's
+        b"SLUS_008.98" | b"SLUC_011.99" => {
+            let hp = game.read::<u16>(offsets.hp);
+            watchers.hp.update(hp.ok());
+
+            let igt = game.read::<u32>(offsets.igt);
+            watchers.igt.update(igt.ok());
+
+            let map_id = game.read::<u16>(offsets.map_id);
+            watchers.map_id.update(map_id.ok());
+
+            let finalinv = game.read::<[[u16; 3]; 12]>(offsets.item_1).unwrap_or_default().map(|[item, _, _]| item);
+            watchers.inventory.update_infallible(finalinv);
+
+            let ending = game.read::<u16>(offsets.ending);
+            watchers.ending.update(ending.ok());
+        }
+        _ => (),
+    }
+}
+
+// If the setting "start" is not selected, nothing will happen
+// Checks to see if the current IGT > 0 and the old IGT == 0
+fn start(watchers: &Watchers, settings: &Settings) -> bool {
+    if !settings.start {
+        return false;
+    }
+
+    settings.start && watchers.igt.pair.is_some_and(|pair| pair.old == 0 && pair.current != 0)
+}
+
+fn split(watchers: &Watchers, settings: &Settings) -> bool {
+   let door_split =  watchers.map_id.pair.is_some_and(|pair| pair.changed()) && settings.door_split;
+   
+   let inventorysplit = watchers.inventory.pair.is_some_and(|pair| (pair.check(|arr| arr.contains(&309)) && settings.keno)
+    || (pair.check(|arr| arr.contains(&303)) && settings.susie)
+    || (pair.check(|arr| arr.contains(&304)) && settings.nancy)
+    || (pair.check(|arr| arr.contains(&302)) && settings.cheryl)
+    || (pair.check(|arr| arr.contains(&310)) && settings.stagekey)
+    || (pair.check(|arr| arr.contains(&305)) && settings.leagan)
+    || (pair.check(|arr| arr.contains(&335)) && settings.attract)
+    || (pair.check(|arr| arr.contains(&336)) && settings.museum)
+    || (pair.check(|arr| arr.contains(&337)) && settings.moon)
+    || (pair.check(|arr| arr.contains(&340)) && settings.evil)
+    || (pair.check(|arr| arr.contains(&308)) && settings.spear)
+    || (pair.check(|arr| arr.contains(&338)) && settings.cardc)
+    || (pair.check(|arr| arr.contains(&339)) && settings.cardd)
+    || (pair.check(|arr| arr.contains(&306)) && settings.sydney)
+    || (pair.check(|arr| arr.contains(&311)) && settings.card9)
+    || (pair.check(|arr| arr.contains(&331)) && settings.bluehand)
+    || (pair.check(|arr| arr.contains(&332)) && settings.redhand)
+    || (pair.check(|arr| arr.contains(&359)) && settings.panel1)
+    || (pair.check(|arr| arr.contains(&363)) && settings.event)
+    || (pair.check(|arr| arr.contains(&364)) && settings.panel2)
+    || (pair.check(|arr| arr.contains(&366)) && settings.panel4)
+    || (pair.check(|arr| arr.contains(&368)) && settings.panel6)
+    || (pair.check(|arr| arr.contains(&343)) && settings.ykey)
+    || (pair.check(|arr| arr.contains(&383)) && settings.d4)
+    || (pair.check(|arr| arr.contains(&385)) && settings.lot)
+    || (pair.check(|arr| arr.contains(&392)) && settings.camp)
+    || (pair.check(|arr| arr.contains(&393)) && settings.small)
+    || (pair.check(|arr| arr.contains(&434)) && settings.fork)
+    || (pair.check(|arr| arr.contains(&408)) && settings.log)
+    || (pair.check(|arr| arr.contains(&435)) && settings.guest)
+    || (pair.check(|arr| arr.contains(&413)) && settings.shower)
+    || (pair.check(|arr| arr.contains(&403)) && settings.shelf)
+    || (pair.check(|arr| arr.contains(&415)) && settings.bourbon)
+    || (pair.check(|arr| arr.contains(&405)) && settings.marlin)
+    || (pair.check(|arr| arr.contains(&404)) && settings.chain)
+    || (pair.check(|arr| arr.contains(&428)) && settings.observ)
+    || (pair.check(|arr| arr.contains(&429)) && settings.sterile)
+    || (pair.check(|arr| arr.contains(&111)) && settings.m8)
+    || (pair.check(|arr| arr.contains(&423)) && settings.sin)
+    || (pair.check(|arr| arr.contains(&430)) && settings.fuse)
+);
+
+    let end = watchers.ending.pair.is_some_and(|pair| pair.current == 65535 && pair.old != 65535) && watchers.map_id.pair.is_some_and(|pair| pair.current == 123 || pair.current == 110) && settings.end;
+
+    door_split || inventorysplit || end
+}
+
+fn reset(watchers: &Watchers, settings: &Settings) -> bool {
+    false
+}
+
+// Some(true) is equivelant to "return true"
+fn is_loading(watchers: &Watchers, settings: &Settings) -> Option<bool> {
+    Some(true)
+}
+
+// Converts the u32 IGT to u64, then divides the time by 30 to get the correct IGT
+fn game_time(watchers: &Watchers, settings: &Settings) -> Option<Duration> {
+    let igt = frame_count::<30>(watchers.igt.pair?.current as u64);
+
+    Some(igt)
+}
