@@ -10,11 +10,12 @@
 )]
 
 use asr::{
-    emulator::ps1::{self, Emulator},
+    emulator::ps1::Emulator,
     future::{next_tick, retry},
     time::Duration,
+    time_util::frame_count,
     timer::{self, TimerState},
-    watcher::Watcher, time_util::frame_count,
+    watcher::Watcher,
 };
 
 asr::panic_handler!();
@@ -25,7 +26,7 @@ async fn main() {
 
     loop {
         // Hook to the target process
-        let mut emulator = retry(|| ps1::Emulator::attach()).await;
+        let mut emulator = retry(|| Emulator::attach()).await;
         let mut watchers = Watchers::default();
         let offsets = Offsets::new();
 
@@ -86,7 +87,7 @@ async fn main() {
 struct Settings {
     #[default = false]
     /// ---------- Start Conditions Below ----------
-    condit: bool,
+    _condit: bool,
 
     #[default = true]
     /// START --> Enable auto start
@@ -94,7 +95,7 @@ struct Settings {
 
     #[default = false]
     /// ---------- Door Splits Below ----------
-    doors: bool,
+    _doors: bool,
 
     #[default = false]
     /// Door splits - Will split on every room
@@ -102,7 +103,7 @@ struct Settings {
 
     #[default = false]
     /// ---------- Item Splits Below ----------
-    items: bool,
+    _items: bool,
 
     #[default = false]
     /// Keno Ticket
@@ -250,13 +251,13 @@ struct Settings {
 
     #[default = false]
     /// Sterilization Passageway Key
-   sterile: bool,
+    sterile: bool,
 
-   #[default = false]
+    #[default = false]
     /// M82A1
-   m8: bool,
+    m8: bool,
 
-   #[default = false]
+    #[default = false]
     /// Code - SIN Key
     sin: bool,
 
@@ -266,22 +267,23 @@ struct Settings {
 
     #[default = false]
     /// ---------- End Split Below ----------
-    ending: bool,
+    _ending: bool,
 
     #[default = false]
     /// Splits on either Good End or Bad End
     end: bool,
-
 }
 
-// Defines the watcher type of 
+// Defines the watcher type of
 #[derive(Default)]
 struct Watchers {
     hp: Watcher<u16>,
-    igt: Watcher<u32>,
+    igt: Watcher<Duration>,
     map_id: Watcher<u16>,
     inventory: Watcher<[u16; 12]>,
     ending: Watcher<u16>,
+    accumulated_igt: Duration,
+    buffer_igt: Duration,
 }
 
 struct Offsets {
@@ -308,30 +310,50 @@ impl Offsets {
 }
 
 fn update_loop(game: &Emulator, offsets: &Offsets, watchers: &mut Watchers) {
-    let Ok(disc_gamecode) = game.read::<[u8; 11]>(offsets.gamecode_ntsc) else {
-        // Do stuff to reset your watchers
-        return;
+    match &game
+        .read::<[u8; 11]>(offsets.gamecode_ntsc)
+        .unwrap_or_default()
+    {
+        b"SLUS_008.98" | b"SLUS_011.99" => {
+            // The gamecodes provided above ensure you are running the correct game
+            watchers.hp.update(game.read::<u16>(offsets.hp).ok());
+            watchers.igt.update_infallible(frame_count::<30>(
+                game.read::<u32>(offsets.igt).unwrap_or_default() as _,
+            ));
+            watchers
+                .map_id
+                .update(game.read::<u16>(offsets.map_id).ok());
+            watchers.inventory.update_infallible(
+                game.read::<[[u16; 3]; 12]>(offsets.item_1)
+                    .unwrap_or_default()
+                    .map(|[item, _, _]| item),
+            );
+            watchers
+                .ending
+                .update(game.read::<u16>(offsets.ending).ok());
+        }
+        _ => {
+            // If the emulator is loading the wrong game, the watchers will update to their default state
+            watchers.hp.update_infallible(u16::default());
+            watchers.igt.update_infallible(Duration::default());
+            watchers.map_id.update_infallible(u16::default());
+            watchers.inventory.update_infallible([u16::default(); 12]);
+            watchers.ending.update_infallible(u16::default());
+        }
     };
 
-    match &disc_gamecode {
-        // Checks the ID of your disk, ensuring that the data here will only work with these specific ID's
-        b"SLUS_008.98" | b"SLUC_011.99" => {
-            let hp = game.read::<u16>(offsets.hp);
-            watchers.hp.update(hp.ok());
 
-            let igt = game.read::<u32>(offsets.igt);
-            watchers.igt.update(igt.ok());
+    // Reset the buffer IGT variables when the timer is stopped
+    if timer::state() == TimerState::NotRunning {
+        watchers.accumulated_igt = Duration::ZERO;
+        watchers.buffer_igt = Duration::ZERO;
+    }
 
-            let map_id = game.read::<u16>(offsets.map_id);
-            watchers.map_id.update(map_id.ok());
-
-            let finalinv = game.read::<[[u16; 3]; 12]>(offsets.item_1).unwrap_or_default().map(|[item, _, _]| item);
-            watchers.inventory.update_infallible(finalinv);
-
-            let ending = game.read::<u16>(offsets.ending);
-            watchers.ending.update(ending.ok());
+    if let Some(igt) = &watchers.igt.pair {
+        if igt.old > igt.current {
+            watchers.accumulated_igt += igt.old - watchers.buffer_igt;
+            watchers.buffer_igt = igt.current;
         }
-        _ => (),
     }
 }
 
@@ -342,71 +364,79 @@ fn start(watchers: &Watchers, settings: &Settings) -> bool {
         return false;
     }
 
-    settings.start && watchers.igt.pair.is_some_and(|pair| pair.old == 0 && pair.current != 0)
+    settings.start
+        && watchers
+            .igt
+            .pair
+            .is_some_and(|pair| pair.changed_from(&Duration::ZERO))
 }
 
 fn split(watchers: &Watchers, settings: &Settings) -> bool {
-   let door_split =  watchers.map_id.pair.is_some_and(|pair| pair.changed()) && settings.door_split;
-   
-   let inventorysplit = watchers.inventory.pair.is_some_and(|pair| (pair.check(|arr| arr.contains(&309)) && settings.keno)
-    || (pair.check(|arr| arr.contains(&303)) && settings.susie)
-    || (pair.check(|arr| arr.contains(&304)) && settings.nancy)
-    || (pair.check(|arr| arr.contains(&302)) && settings.cheryl)
-    || (pair.check(|arr| arr.contains(&310)) && settings.stagekey)
-    || (pair.check(|arr| arr.contains(&305)) && settings.leagan)
-    || (pair.check(|arr| arr.contains(&335)) && settings.attract)
-    || (pair.check(|arr| arr.contains(&336)) && settings.museum)
-    || (pair.check(|arr| arr.contains(&337)) && settings.moon)
-    || (pair.check(|arr| arr.contains(&340)) && settings.evil)
-    || (pair.check(|arr| arr.contains(&308)) && settings.spear)
-    || (pair.check(|arr| arr.contains(&338)) && settings.cardc)
-    || (pair.check(|arr| arr.contains(&339)) && settings.cardd)
-    || (pair.check(|arr| arr.contains(&306)) && settings.sydney)
-    || (pair.check(|arr| arr.contains(&311)) && settings.card9)
-    || (pair.check(|arr| arr.contains(&331)) && settings.bluehand)
-    || (pair.check(|arr| arr.contains(&332)) && settings.redhand)
-    || (pair.check(|arr| arr.contains(&359)) && settings.panel1)
-    || (pair.check(|arr| arr.contains(&363)) && settings.event)
-    || (pair.check(|arr| arr.contains(&364)) && settings.panel2)
-    || (pair.check(|arr| arr.contains(&366)) && settings.panel4)
-    || (pair.check(|arr| arr.contains(&368)) && settings.panel6)
-    || (pair.check(|arr| arr.contains(&343)) && settings.ykey)
-    || (pair.check(|arr| arr.contains(&383)) && settings.d4)
-    || (pair.check(|arr| arr.contains(&385)) && settings.lot)
-    || (pair.check(|arr| arr.contains(&392)) && settings.camp)
-    || (pair.check(|arr| arr.contains(&393)) && settings.small)
-    || (pair.check(|arr| arr.contains(&434)) && settings.fork)
-    || (pair.check(|arr| arr.contains(&408)) && settings.log)
-    || (pair.check(|arr| arr.contains(&435)) && settings.guest)
-    || (pair.check(|arr| arr.contains(&413)) && settings.shower)
-    || (pair.check(|arr| arr.contains(&403)) && settings.shelf)
-    || (pair.check(|arr| arr.contains(&415)) && settings.bourbon)
-    || (pair.check(|arr| arr.contains(&405)) && settings.marlin)
-    || (pair.check(|arr| arr.contains(&404)) && settings.chain)
-    || (pair.check(|arr| arr.contains(&428)) && settings.observ)
-    || (pair.check(|arr| arr.contains(&429)) && settings.sterile)
-    || (pair.check(|arr| arr.contains(&111)) && settings.m8)
-    || (pair.check(|arr| arr.contains(&423)) && settings.sin)
-    || (pair.check(|arr| arr.contains(&430)) && settings.fuse)
-);
-
-    let end = watchers.ending.pair.is_some_and(|pair| pair.current == 65535 && pair.old != 65535) && watchers.map_id.pair.is_some_and(|pair| pair.current == 123 || pair.current == 110) && settings.end;
-
-    door_split || inventorysplit || end
+    if settings.door_split && watchers.map_id.pair.is_some_and(|i| i.changed()) {
+        true
+    } else if settings.end
+        && watchers.ending.pair.is_some_and(|i| i.changed_to(&0xFFFF))
+        && watchers
+            .map_id
+            .pair
+            .is_some_and(|i| i.changed() && (i.current == 123 || i.current == 110))
+    {
+        true
+    } else {
+        watchers.inventory.pair.is_some_and(|inventory| {
+        (settings.keno && inventory.check(|arr| arr.contains(&309)))
+            || (settings.susie && inventory.check(|arr| arr.contains(&303)))
+            || (settings.nancy && inventory.check(|arr| arr.contains(&304)))
+            || (settings.cheryl && inventory.check(|arr| arr.contains(&302)))
+            || (settings.stagekey && inventory.check(|arr| arr.contains(&310)))
+            || (settings.leagan && inventory.check(|arr| arr.contains(&305)))
+            || (settings.attract && inventory.check(|arr| arr.contains(&335)))
+            || (settings.museum && inventory.check(|arr| arr.contains(&336)))
+            || (settings.moon && inventory.check(|arr| arr.contains(&337)))
+            || (settings.evil && inventory.check(|arr| arr.contains(&340)))
+            || (settings.spear && inventory.check(|arr| arr.contains(&308)))
+            || (settings.cardc && inventory.check(|arr| arr.contains(&338)))
+            || (settings.cardd && inventory.check(|arr| arr.contains(&339)))
+            || (settings.sydney && inventory.check(|arr| arr.contains(&306)))
+            || (settings.card9 && inventory.check(|arr| arr.contains(&311)))
+            || (settings.bluehand && inventory.check(|arr| arr.contains(&331)))
+            || (settings.redhand && inventory.check(|arr| arr.contains(&332)))
+            || (settings.panel1 && inventory.check(|arr| arr.contains(&359)))
+            || (settings.event && inventory.check(|arr| arr.contains(&363)))
+            || (settings.panel2 && inventory.check(|arr| arr.contains(&364)))
+            || (settings.panel4 && inventory.check(|arr| arr.contains(&366)))
+            || (settings.panel6 && inventory.check(|arr| arr.contains(&368)))
+            || (settings.ykey && inventory.check(|arr| arr.contains(&343)))
+            || (settings.d4 && inventory.check(|arr| arr.contains(&383)))
+            || (settings.lot && inventory.check(|arr| arr.contains(&385)))
+            || (settings.camp && inventory.check(|arr| arr.contains(&392)))
+            || (settings.small && inventory.check(|arr| arr.contains(&393)))
+            || (settings.fork && inventory.check(|arr| arr.contains(&434)))
+            || (settings.log && inventory.check(|arr| arr.contains(&408)))
+            || (settings.guest && inventory.check(|arr| arr.contains(&435)))
+            || (settings.shower && inventory.check(|arr| arr.contains(&413)))
+            || (settings.shelf && inventory.check(|arr| arr.contains(&403)))
+            || (settings.bourbon && inventory.check(|arr| arr.contains(&415)))
+            || (settings.marlin && inventory.check(|arr| arr.contains(&405)))
+            || (settings.chain && inventory.check(|arr| arr.contains(&404)))
+            || (settings.observ && inventory.check(|arr| arr.contains(&428)))
+            || (settings.sterile && inventory.check(|arr| arr.contains(&429)))
+            || (settings.m8 && inventory.check(|arr| arr.contains(&111)))
+            || (settings.sin && inventory.check(|arr| arr.contains(&423)))
+            || (settings.fuse && inventory.check(|arr| arr.contains(&430)))
+        })
+    }
 }
 
-fn reset(watchers: &Watchers, settings: &Settings) -> bool {
+fn reset(_watchers: &Watchers, _settings: &Settings) -> bool {
     false
 }
 
 // Some(true) is equivelant to "return true"
-fn is_loading(watchers: &Watchers, settings: &Settings) -> Option<bool> {
+fn is_loading(_watchers: &Watchers, _settings: &Settings) -> Option<bool> {
     Some(true)
 }
 
-// Converts the u32 IGT to u64, then divides the time by 30 to get the correct IGT
-fn game_time(watchers: &Watchers, settings: &Settings) -> Option<Duration> {
-    let igt = frame_count::<30>(watchers.igt.pair?.current as u64);
-
-    Some(igt)
+fn game_time(watchers: &Watchers, _settings: &Settings) -> Option<Duration> {
+    Some(watchers.igt.pair?.current + watchers.accumulated_igt - watchers.buffer_igt)
 }
